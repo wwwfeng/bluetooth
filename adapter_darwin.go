@@ -40,6 +40,24 @@ var DefaultAdapter = &Adapter{
 	},
 }
 
+// Reset will re-initialize the underlying cbgo CentralManager and PeripheralManager.
+// Useful when BLE is stuck after sleep, lid close/open, or system wake.
+func (a *Adapter) Reset() {
+
+	_ = a.StopScan()
+
+	a.scanChan = nil
+	a.poweredChan = nil
+
+	// Recreate cbgo objects
+	a.cm = cbgo.NewCentralManager(nil)
+	a.pm = cbgo.NewPeripheralManager(nil)
+
+	a.cmd = nil
+	a.pmd = nil
+
+}
+
 // Enable configures the BLE stack. It must be called before any
 // Bluetooth-related calls (unless otherwise indicated).
 func (a *Adapter) Enable() error {
@@ -47,18 +65,26 @@ func (a *Adapter) Enable() error {
 		return errors.New("already calling Enable function")
 	}
 
-	// wait until powered
+	state := a.cm.State()
+
+	if state == cbgo.ManagerStatePoweredOn {
+		a.cmd = &centralManagerDelegate{a: a}
+		a.cm.SetDelegate(a.cmd)
+
+		a.pmd = &peripheralManagerDelegate{a: a}
+		a.pm.SetDelegate(a.pmd)
+		return nil
+	}
+
 	a.poweredChan = make(chan error, 1)
 
 	a.cmd = &centralManagerDelegate{a: a}
 	a.cm.SetDelegate(a.cmd)
 
-	if a.cm.State() != cbgo.ManagerStatePoweredOn {
-		select {
-		case <-a.poweredChan:
-		case <-time.NewTimer(10 * time.Second).C:
-			return errors.New("timeout enabling CentralManager")
-		}
+	select {
+	case <-a.poweredChan:
+	case <-time.After(10 * time.Second):
+		return errors.New("timeout enabling CentralManager")
 	}
 
 	// drain any extra powered-on events from channel
@@ -66,7 +92,6 @@ func (a *Adapter) Enable() error {
 		<-a.poweredChan
 	}
 
-	// wait until powered?
 	a.pmd = &peripheralManagerDelegate{a: a}
 	a.pm.SetDelegate(a.pmd)
 
@@ -83,12 +108,10 @@ type centralManagerDelegate struct {
 
 // CentralManagerDidUpdateState when central manager state updated.
 func (cmd *centralManagerDelegate) CentralManagerDidUpdateState(cmgr cbgo.CentralManager) {
-	// powered on?
-	if cmgr.State() == cbgo.ManagerStatePoweredOn {
-		cmd.a.poweredChan <- nil
+	select {
+	case cmd.a.poweredChan <- nil:
+	default:
 	}
-
-	// TODO: handle other state changes.
 }
 
 // DidDiscoverPeripheral when peripheral is discovered.
