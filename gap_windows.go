@@ -431,6 +431,11 @@ func (a *Adapter) Connect(address Address, params ConnectionParams) (Device, err
 
 	if err != nil {
 		_ = handler.Release()
+		_ = newSession.SetMaintainConnection(false)
+		_ = newSession.Close()
+		newSession.Release()
+		_ = bleDevice.Close()
+		bleDevice.Release()
 		return device, err
 	}
 
@@ -448,23 +453,35 @@ func (d Device) Disconnect() error {
 
 	d.cancel()
 
-	if err := d.session.Close(); err != nil {
-		return err
+	var disconnectErr error
+	if err := d.session.SetMaintainConnection(false); err != nil {
+		disconnectErr = err
+	}
+
+	if err := d.session.Close(); err != nil && disconnectErr == nil {
+		disconnectErr = err
 	}
 
 	_ = d.device.RemoveConnectionStatusChanged(d.connectionStatusListenerToken)
 
-	if err := d.device.Close(); err != nil {
-		return err
+	if err := d.device.Close(); err != nil && disconnectErr == nil {
+		disconnectErr = err
 	}
 
-	return nil
+	return disconnectErr
 }
 
 // Connected returns whether the device is currently connected.
 func (d Device) Connected() (bool, error) {
 	if d.device == nil {
 		return false, nil
+	}
+	if d.ctx != nil {
+		select {
+		case <-d.ctx.Done():
+			return false, nil
+		default:
+		}
 	}
 	status, err := d.device.GetConnectionStatus()
 	if err != nil {
