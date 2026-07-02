@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"syscall"
 	"unsafe"
 
@@ -226,19 +227,22 @@ func getScanResultFromArgs(args *advertisement.BluetoothLEAdvertisementReceivedE
 	}
 
 	winAdv, err := args.GetAdvertisement()
-	if err != nil {
+	if err != nil || winAdv == nil {
 		return result
 	}
 	defer winAdv.Release()
 
 	var manufacturerData []ManufacturerDataElement
 	var serviceUUIDs []UUID
-	if winAdv, err := args.GetAdvertisement(); err == nil && winAdv != nil {
-		// Extract manufacturer data
-		vector, _ := winAdv.GetManufacturerData()
+	// Extract manufacturer data. Windows can deliver advertisement events
+	// without these vectors populated, so every WinRT vector must be nil-checked.
+	if vector, err := winAdv.GetManufacturerData(); err == nil && vector != nil {
 		size, _ := vector.GetSize()
 		for i := uint32(0); i < size; i++ {
 			element, _ := vector.GetAt(i)
+			if element == nil {
+				continue
+			}
 			manData := (*advertisement.BluetoothLEManufacturerData)(element)
 
 			companyID, _ := manData.GetCompanyId()
@@ -248,10 +252,11 @@ func getScanResultFromArgs(args *advertisement.BluetoothLEAdvertisementReceivedE
 				Data:      bufferToSlice(buffer),
 			})
 		}
+	}
 
-		// Extract service UUIDs
-		vector, _ = winAdv.GetServiceUuids()
-		size, _ = vector.GetSize()
+	// Extract service UUIDs.
+	if vector, err := winAdv.GetServiceUuids(); err == nil && vector != nil {
+		size, _ := vector.GetSize()
 		for i := uint32(0); i < size; i++ {
 			element, _ := vector.GetAt(i)
 			// element is not a pointer, but a GUID struct. But we cannot convert
@@ -293,13 +298,25 @@ func GUIDToUUID(guid syscall.GUID) UUID {
 }
 
 func bufferToSlice(buffer *streams.IBuffer) []byte {
-	dataReader, _ := streams.DataReaderFromBuffer(buffer)
+	if buffer == nil {
+		return nil
+	}
+	dataReader, err := streams.DataReaderFromBuffer(buffer)
+	if err != nil || dataReader == nil {
+		return nil
+	}
 	defer dataReader.Release()
-	bufferSize, _ := buffer.GetLength()
+	bufferSize, err := buffer.GetLength()
+	if err != nil {
+		return nil
+	}
 	if bufferSize == 0 {
 		return nil
 	}
-	data, _ := dataReader.ReadBytes(bufferSize)
+	data, err := dataReader.ReadBytes(bufferSize)
+	if err != nil {
+		return nil
+	}
 	return data
 }
 
@@ -326,6 +343,9 @@ type Device struct {
 	session                       *genericattributeprofile.GattSession
 	connectionStatusListenerToken foundation.EventRegistrationToken
 	connectionStatusListener      *foundation.TypedEventHandler
+	disconnecting                 *atomic.Bool
+	connectNotified               *atomic.Bool
+	disconnectNotified            *atomic.Bool
 }
 
 // Connect starts a connection attempt to the given peripheral device address.
@@ -365,6 +385,8 @@ func (a *Adapter) Connect(address Address, params ConnectionParams) (Device, err
 	// To initiate a connection, we need to set GattSession.MaintainConnection to true.
 	dID, err := bleDevice.GetBluetoothDeviceId()
 	if err != nil {
+		_ = bleDevice.Close()
+		bleDevice.Release()
 		return Device{}, err
 	}
 
@@ -373,20 +395,34 @@ func (a *Adapter) Connect(address Address, params ConnectionParams) (Device, err
 	// by the calling program.
 	gattSessionOp, err := genericattributeprofile.GattSessionFromDeviceIdAsync(dID) // IAsyncOperation<GattSession>
 	if err != nil {
+		_ = bleDevice.Close()
+		bleDevice.Release()
 		return Device{}, err
 	}
 
 	if err := awaitAsyncOperation(gattSessionOp, genericattributeprofile.SignatureGattSession); err != nil {
+		_ = bleDevice.Close()
+		bleDevice.Release()
 		return Device{}, fmt.Errorf("error getting gatt session: %w", err)
 	}
 
 	gattRes, err := gattSessionOp.GetResults()
 	if err != nil {
+		_ = bleDevice.Close()
+		bleDevice.Release()
 		return Device{}, err
+	}
+	if uintptr(gattRes) == 0x0 {
+		_ = bleDevice.Close()
+		bleDevice.Release()
+		return Device{}, fmt.Errorf("gatt session was not found")
 	}
 	newSession := (*genericattributeprofile.GattSession)(gattRes)
 	// This keeps the device connected until we set maintain_connection = False.
 	if err := newSession.SetMaintainConnection(true); err != nil {
+		newSession.Release()
+		_ = bleDevice.Close()
+		bleDevice.Release()
 		return Device{}, err
 	}
 
@@ -400,6 +436,10 @@ func (a *Adapter) Connect(address Address, params ConnectionParams) (Device, err
 
 		device:  bleDevice,
 		session: newSession,
+
+		disconnecting:      &atomic.Bool{},
+		connectNotified:    &atomic.Bool{},
+		disconnectNotified: &atomic.Bool{},
 	}
 
 	// https://learn.microsoft.com/es-es/uwp/api/windows.devices.bluetooth.bluetoothledevice.connectionstatuschanged?view=winrt-26100
@@ -416,11 +456,17 @@ func (a *Adapter) Connect(address Address, params ConnectionParams) (Device, err
 			return
 		}
 		if status == bluetooth.BluetoothConnectionStatusDisconnected {
-			device.Disconnect()
+			if device.markDisconnectNotified() && a.connectHandler != nil {
+				a.connectHandler(device, false)
+			}
+			go func() {
+				_ = device.Disconnect()
+			}()
+			return
 		}
 
-		if a.connectHandler != nil {
-			a.connectHandler(device, status == bluetooth.BluetoothConnectionStatusConnected)
+		if status == bluetooth.BluetoothConnectionStatusConnected && device.markConnectNotified() && a.connectHandler != nil {
+			a.connectHandler(device, true)
 		}
 	})
 
@@ -436,36 +482,77 @@ func (a *Adapter) Connect(address Address, params ConnectionParams) (Device, err
 		newSession.Release()
 		_ = bleDevice.Close()
 		bleDevice.Release()
-		return device, err
+		return Device{}, err
 	}
 
 	return device, nil
 }
 
+func (d Device) beginDisconnect() bool {
+	if d.disconnecting == nil {
+		return true
+	}
+	return d.disconnecting.CompareAndSwap(false, true)
+}
+
+func (d Device) markDisconnectNotified() bool {
+	if d.disconnectNotified == nil {
+		return true
+	}
+	return d.disconnectNotified.CompareAndSwap(false, true)
+}
+
+func (d Device) markConnectNotified() bool {
+	if d.connectNotified == nil {
+		return true
+	}
+	return d.connectNotified.CompareAndSwap(false, true)
+}
+
 // Disconnect from the BLE device. This method is non-blocking and does not
 // wait until the connection is fully gone.
 func (d Device) Disconnect() error {
-	defer d.device.Release()
-	defer d.session.Release()
+	if !d.beginDisconnect() {
+		return nil
+	}
+
+	if d.cancel != nil {
+		d.cancel()
+	}
+
+	if d.device == nil && d.session == nil {
+		return nil
+	}
+
+	if d.device != nil {
+		defer d.device.Release()
+	}
+	if d.session != nil {
+		defer d.session.Release()
+	}
 	if d.connectionStatusListener != nil {
 		defer d.connectionStatusListener.Release()
 	}
 
-	d.cancel()
-
 	var disconnectErr error
-	if err := d.session.SetMaintainConnection(false); err != nil {
-		disconnectErr = err
+	if d.session != nil {
+		if err := d.session.SetMaintainConnection(false); err != nil {
+			disconnectErr = err
+		}
+
+		if err := d.session.Close(); err != nil && disconnectErr == nil {
+			disconnectErr = err
+		}
 	}
 
-	if err := d.session.Close(); err != nil && disconnectErr == nil {
-		disconnectErr = err
+	if d.device != nil && d.connectionStatusListener != nil {
+		_ = d.device.RemoveConnectionStatusChanged(d.connectionStatusListenerToken)
 	}
 
-	_ = d.device.RemoveConnectionStatusChanged(d.connectionStatusListenerToken)
-
-	if err := d.device.Close(); err != nil && disconnectErr == nil {
-		disconnectErr = err
+	if d.device != nil {
+		if err := d.device.Close(); err != nil && disconnectErr == nil {
+			disconnectErr = err
+		}
 	}
 
 	return disconnectErr
